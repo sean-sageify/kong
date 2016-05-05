@@ -4,6 +4,9 @@ local cache = require "kong.tools.database_cache"
 local stringy = require "stringy"
 local constants = require "kong.constants"
 local responses = require "kong.tools.responses"
+local stringy = require "stringy"
+local resolver = require "resty.dns.resolver"
+local cache = require "kong.tools.database_cache"
 
 local table_insert = table.insert
 local table_sort = table.sort
@@ -49,9 +52,7 @@ local function get_upstream_url(api)
   return result
 end
 
-local function get_host_from_upstream_url(val)
-  local parsed_url = url.parse(val)
-
+local function get_host_from_upstream_url(parsed_url)
   local port
   if parsed_url.port then
     port = parsed_url.port
@@ -222,6 +223,75 @@ local function url_has_path(url)
   return count_slashes > 2
 end
 
+
+local function dns_query(address, type)
+  -- Init the resolver
+  local dns_resolver_parts = stringy.split(singletons.configuration.dns_resolver.address, ":")
+  local r, err = resolver:new{
+    nameservers = {{dns_resolver_parts[1], dns_resolver_parts[2]}},
+    retrans = 5,
+    timeout = 2000
+  }
+  if not r then
+    return nil, "Startup error: "..err
+  end
+
+  -- Make query
+  local answers, err = r:query(address, {qtype = r["TYPE_"..type]})
+  if not answers then
+    return nil, "failed to query the DNS server: ", err
+  end
+
+  if answers.errcode then
+    return nil, "server returned error code: ", answers.errcode, ": ", answers.errstr
+  end
+
+  return answers
+end
+
+local function resolve_dns_address(address, port)
+  -- Retrieve from cache
+  local cache_key = cache.dns_key(address)
+  local result = cache.get(cache_key)
+  if result then
+    return result.host, result.port
+  end
+
+  -- Query for A record
+  local answers, err = dns_query(address, "A")
+  if err then
+    ngx.log(ngx.ERR, err)
+    return ngx.exit(500)
+  end
+  if #answers <= 0 then
+    ngx.log(ngx.ERR, "could not find any record for ", address)
+    return ngx.exit(500)
+  end
+
+  local a_answer = answers[1]
+  local final_address = a_answer.address
+
+  -- Query for SRV record
+  local final_port = port
+  local answers, err = dns_query(address, "SRV")
+  if err then
+    ngx.log(ngx.ERR, err)
+    return ngx.exit(500)
+  end
+  if #answers > 0 then
+    local srv_answer = answers[1]
+    if srv_answer.port > 0 then
+      final_port = srv_answer.port
+    end
+  end
+
+  if a_answer.ttl > 0 then
+    cache.set(cache_key, {host = final_address, port = final_port}, a_answer.ttl)
+  end
+
+  return final_address, final_port
+end
+
 function _M.execute(request_uri, request_headers)
   local uri = unpack(stringy.split(request_uri, "?"))
   local err, api, matched_host, hosts_list, strip_request_path_pattern = find_api(uri, request_headers)
@@ -250,11 +320,14 @@ function _M.execute(request_uri, request_headers)
     upstream_host = matched_host or ngx.req.get_headers()["host"]
   end
 
+  local parsed_url = url.parse(upstream_url)
   if upstream_host == nil then
-    upstream_host = get_host_from_upstream_url(upstream_url)
+    upstream_host = get_host_from_upstream_url(parsed_url)
   end
 
-  return api, upstream_url, upstream_host
+  -- Resolve the appropriate DNS
+  local address, port = resolve_dns_address(parsed_url.host, parsed_url.port)
+  return api, parsed_url.scheme.."://"..address..(port and ":"..port or "")..parsed_url.path, upstream_host
 end
 
 return _M
